@@ -6,13 +6,11 @@
     [org.apache.kafka.clients.consumer KafkaConsumer]
     [org.apache.kafka.common.serialization StringDeserializer]))
 
-(def kafka-server "localhost:9092") ; TODO get it from cli opts/env
-
 (def filter-id (atom 0))
 (def filters (agent {})) ; {filter-key {:topic topic :q q :msgs [msgs]}}
 (def filters-by-topic (agent {})) ; {topic-key #{filter-ids}}
 
-(def consumer
+(defn mk-consumer [kafka-server]
   (KafkaConsumer. {"bootstrap.servers",  kafka-server
                    "group.id",           "example"
                    "key.deserializer",   StringDeserializer
@@ -43,13 +41,14 @@
                       (send filters update-in [filter-id :msgs] #(concat % matched))))))))
        doall))
 
-(defn main-loop []
-  (while 1
-    (let [topics (->> @filters vals (map :topic))]
-      (.subscribe consumer topics)
-      (if (seq topics)
-        (process-msgs (.poll consumer (Duration/ofMillis 1000))) ;Long/MAX_VALUE))
-        (Thread/sleep 1000)))))
+(defn main-loop [kafka-server]
+  (let [consumer (mk-consumer kafka-server)]
+    (while 1
+      (let [topics (->> @filters vals (map :topic))]
+        (.subscribe consumer topics)
+        (if (seq topics)
+          (process-msgs (.poll consumer (Duration/ofMillis 1000))) ;Long/MAX_VALUE))
+          (Thread/sleep 1000))))))
 
 ;; API handlers
 
