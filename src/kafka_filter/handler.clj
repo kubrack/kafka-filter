@@ -13,7 +13,7 @@
    :wrap (fn [handler]
            (fn [request]
              (let [resp (handler request)]
-               (log/debug "log-resp-middleware" resp)
+               (log/debug resp)
                resp)))})
 
 (defn get-handler [{:keys [params]}]

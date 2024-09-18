@@ -12,12 +12,6 @@
 (def filters (agent {})) ; {filter-key {:topic topic :q q :msgs [msgs]}}
 (def filters-by-topic (agent {})) ; {topic-key #{filter-ids}}
 
-(defn watcher [k _r before after]
-  (log/debug k before "->" after))
-
-(add-watch filters "FILTERS:" watcher)
-(add-watch filters-by-topic "TOPICS: " watcher)
-
 (def consumer
   (KafkaConsumer. {"bootstrap.servers",  kafka-server
                    "group.id",           "example"
@@ -31,9 +25,9 @@
    (fn [val] (re-find re val))))
 
 (defn process-msgs [records]
-  (when (seq records) (log/debug records))
   (->> records
        (map (fn [r] [(.topic r) (.value r)]))
+       ((fn [r] (when (seq r) (log/debug "Got" (count r) "new records")) r))
        (group-by first)
        (map (fn [[topic pairs]] [topic (map second pairs)]))
        (map (fn [[topic values]]
@@ -45,6 +39,7 @@
                   (let [matched (filter checker values)
                         filter-id (checker)]
                     (when (seq matched)
+                      (log/debug (count matched) "records matched filter" filter-id)
                       (send filters update-in [filter-id :msgs] #(concat % matched))))))))
        doall))
 
@@ -52,7 +47,6 @@
   (while 1
     (let [topics (->> @filters vals (map :topic))]
       (.subscribe consumer topics)
-      ;(log/debug ".subscription" (-> consumer .subscription))
       (if (seq topics)
         (process-msgs (.poll consumer (Duration/ofMillis 1000))) ;Long/MAX_VALUE))
         (Thread/sleep 1000)))))
