@@ -6,6 +6,7 @@
                  [metosin/reitit "0.7.2"]
                  [org.apache.kafka/kafka-clients "3.8.0"]
                  [org.clojure/clojure "1.11.1"]
+                 [org.clojure/core.async "1.6.681"]
                  [ring/ring-jetty-adapter "1.10.0"]]
   :plugins [[lein-ring "0.12.5"]]
   :ring {:handler kafka-filter.handler/app}
