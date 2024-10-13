@@ -1,14 +1,20 @@
 (ns kafka-filter.filter
   (:require
+    [clojure.core.async :as a]
     [taoensso.timbre :as log])
   (:import
     [java.time Duration]
     [org.apache.kafka.clients.consumer KafkaConsumer]
     [org.apache.kafka.common.serialization StringDeserializer]))
 
+(def pool-timeout-ms 1000)
+(def ch-buf-len 1000)
+
 (def filter-id (atom 0))
-(def filters (agent {})) ; {filter-key {:topic topic :q q :msgs [msgs]}}
-(def filters-by-topic (agent {})) ; {topic-key #{filter-ids}}
+(def filters (agent {}))
+
+(def msg-ch (a/chan ch-buf-len))
+(def pub-ch (a/pub msg-ch :topic))
 
 (defn mk-consumer [kafka-server]
   (KafkaConsumer. {"bootstrap.servers",  kafka-server
@@ -22,33 +28,18 @@
   (let [re (re-pattern (str "(?i)" q))]
    (fn [val] (re-find re val))))
 
-(defn process-msgs [records]
-  (->> records
-       (map (fn [r] [(.topic r) (.value r)]))
-       ((fn [r] (when (seq r) (log/debug "Got" (count r) "new records")) r))
-       (group-by first)
-       (map (fn [[topic pairs]] [topic (map second pairs)]))
-       (map (fn [[topic values]]
-              (let [checkers (->> (keyword topic)
-                                  (get @filters-by-topic)
-                                  (map #(get-in @filters [% :checker]))
-                                  (into []))]
-                (doseq [checker checkers]
-                  (let [matched (filter checker values)
-                        filter-id (checker)]
-                    (when (seq matched)
-                      (log/debug (count matched) "records matched filter" filter-id)
-                      (send filters update-in [filter-id :msgs] #(concat % matched))))))))
-       doall))
-
 (defn main-loop [kafka-server]
   (let [consumer (mk-consumer kafka-server)]
     (while 1
-      (let [topics (->> @filters vals (map :topic))]
+      (let [topics (->> @filters vals (map :topic) (into #{}))]
         (.subscribe consumer topics)
         (if (seq topics)
-          (process-msgs (.poll consumer (Duration/ofMillis 1000))) ;Long/MAX_VALUE))
-          (Thread/sleep 1000))))))
+          (let [n (->> (.poll consumer (Duration/ofMillis pool-timeout-ms))
+                       (map (fn [r] (a/>!! msg-ch {:topic (-> r .topic keyword)
+                                                   :msg   (.value r)})))
+                       count)]
+            (when (not (zero? n)) (log/debug "Got" n "new msgs")))
+          (Thread/sleep pool-timeout-ms))))))
 
 ;; API handlers
 
@@ -60,41 +51,34 @@
 (defn get-filters []
   {:status :ok
    :result (->> @filters
-                (map (fn [[k v]] [k (dissoc v :msgs :checker)]))
+                (map (fn [[k v]] [k (dissoc v :msgs :chan)]))
                 (into {}))})
 
 (defn del-filter [id]
   (let [f-key (-> id str keyword)
         current-filters @(send filters dissoc f-key)
-        topic (-> current-filters (get f-key) :topic )
-        topic-key (keyword topic)]
-    (if topic-key
+        topic (get-in current-filters [f-key :topic])
+        topic-ch (get-in current-filters [f-key :chan])]
+    (if topic
       (do
-        (send filters-by-topic
-              (fn [current-topic-key->filters]
-                (let [t-filters (-> current-topic-key->filters
-                                    (get topic-key)
-                                    (disj f-key))]
-                  (if (-> current-topic-key->filters topic-key seq)
-                    (assoc current-topic-key->filters topic-key t-filters)
-                    (dissoc current-topic-key->filters topic-key)))))
+        (a/unsub pub-ch (keyword topic) topic-ch)
         {:status :ok})
       {:status "id not found"})))
 
 (defn add-filter [topic q]
   (let [id (swap! filter-id inc)
         f-key (-> id str keyword)
-        checker (fn ([] f-key) ([s] ((pred-by-q q) s)))]
-    (send filters assoc f-key {:topic topic :q q
+        checker (pred-by-q q)
+        topic-ch (a/chan ch-buf-len (comp (map :msg) (filter checker)))]
+    (send filters assoc f-key {:topic topic
+                               :q q
                                :msgs []
-                               :checker checker})
-    (send filters-by-topic
-          (fn [current-topic-key->filters]
-            (let [t-key (keyword topic)
-                  t-filters (-> current-topic-key->filters
-                                (get t-key)
-                                (->> (into #{}))
-                                (conj f-key))]
-              (assoc current-topic-key->filters t-key t-filters))))
+                               :chan topic-ch})
+    (a/sub pub-ch (keyword topic) topic-ch)
+    (a/go-loop []
+      (when-let [msg (a/<! topic-ch)]
+          (log/debug "Got a msg matched filter" f-key ":" msg)
+          (send filters update-in [f-key :msgs] #(conj % msg)))
+          (recur))
     {:status :ok :result {:topic topic :q q :id id}}))
 
